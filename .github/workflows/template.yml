@@ -1,77 +1,124 @@
+# ============================================================
+# ADF CI/CD Reusable Deployment Workflow (template.yml)
+# ============================================================
+# This is a reusable workflow called via `workflow_call` from
+# working repositories (uat_deploy.yml / prod_deploy.yml).
+#
+# WHAT IT DOES (in order):
+#   1.  Checkout working repo (ARM templates + .env files)
+#   2.  Mint a GitHub App token to access this template repo
+#   3.  Checkout this template repo (update.ps1, updateIR.ps1)
+#   4.  Authenticate to Azure via Managed Identity (OIDC)
+#   5.  Install @microsoft/azure-data-factory-utilities (npm)
+#   6.  Validate ADF JSON against the DEV factory resource
+#   7.  Export ARM templates from DEV ADF → ./ArmTemplate/
+#   8.  Replace Source IR name with Target IR name in ARM files
+#   9.  Merge .env/<ENV>.txt overrides into parameters.updated.json
+#   10. PrePostDeploymentScript.ps1 (predeployment=true)  → stop triggers
+#   11. azure/arm-deploy → Incremental deployment to target RG
+#   12. PrePostDeploymentScript.ps1 (predeployment=false) → restart triggers + cleanup
+#
+# SECRETS REQUIRED (org or repo level):
+#   APP_ID      - GitHub App ID (for cross-repo checkout)
+#   PRIVATE_KEY - GitHub App private key
+# ============================================================
+
 name: ADF CI/CD Pipeline
 
 on:
   workflow_call:
     inputs:
-          ParameterFileName:
-            required: true
-            type: string
-          environment:
-            required: true
-            type: string
-          SRC_ADF_NAME:
-            required: true
-            type: string
-          SRC_RG:
-            required: true
-            type: string
-          SRC_SUBS_ID:
-            required: true
-            type: string
-          TENANT_ID:
-            required: true
-            type: string
-          TRG_ADF_NAME:
-            required: true
-            type: string
-          TRG_RG:
-            required: true
-            type: string
-          TRG_SUBS_ID:
-            required: true
-            type: string
-          SourceIRName:
-            required: true
-            type: string
-          TargetIRName:
-            required: true
-            type: string
-          Runner_Group:
-            required: true
-            type: string
+      ParameterFileName:
+        description: 'Relative path to the master ARM parameter file'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment label (UAT | Prod) — must match GitHub Environment name and .env/<ENV>.txt'
+        required: true
+        type: string
+      SRC_ADF_NAME:
+        description: 'Source (DEV) ADF factory name — ARM templates are exported from here'
+        required: true
+        type: string
+      SRC_RG:
+        description: 'Resource group of the Source (DEV) ADF'
+        required: true
+        type: string
+      SRC_SUBS_ID:
+        description: 'Subscription ID of the Source (DEV) ADF'
+        required: true
+        type: string
+      TENANT_ID:
+        description: 'Azure AD Tenant ID'
+        required: true
+        type: string
+      TRG_ADF_NAME:
+        description: 'Target ADF factory name — deployment destination'
+        required: true
+        type: string
+      TRG_RG:
+        description: 'Resource group of the Target ADF'
+        required: true
+        type: string
+      TRG_SUBS_ID:
+        description: 'Subscription ID of the Target ADF'
+        required: true
+        type: string
+      SourceIRName:
+        description: 'Integration Runtime name in the Source (DEV) ADF'
+        required: true
+        type: string
+      TargetIRName:
+        description: 'Integration Runtime name in the Target ADF — replaces SourceIRName in ARM files'
+        required: true
+        type: string
+      Runner_Group:
+        description: 'Self-hosted runner group label (e.g. Non-Prod | Prod)'
+        required: true
+        type: string
+      STORAGE_ACCOUNT:
+        description: 'Storage account name for linked template artifact staging (optional)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build:
     name: Build & Deploy ADF Artifacts
     environment: ${{ inputs.environment }}
     env:
-        SOURCE_DIR: './ArmTemplate'
-        FILE_PATTERN: '.json'
-        REPLACE_KEY1: ${{ inputs.SourceIRName }}
-        REPLACE_VALUE1: ${{ inputs.TargetIRName }}
+      SOURCE_DIR: './ArmTemplate'
+      FILE_PATTERN: '.json'
+      REPLACE_KEY1: ${{ inputs.SourceIRName }}
+      REPLACE_VALUE1: ${{ inputs.TargetIRName }}
     runs-on:
       group: ${{ inputs.Runner_Group }}
       labels: [self-hosted]
+
     steps:
+      # ── 1. Checkout working repo ──────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v3
 
+      # ── 2. Mint GitHub App token (needed to pull this private template repo) ──
       - name: Create GitHub App Token
         id: app-token
         uses: actions/create-github-app-token@v2.2.0
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.PRIVATE_KEY }}
-          owner: ATCO-Data-Analytics
+          owner: <YOUR_ORG>
 
+      # ── 3. Checkout template repo (update.ps1, updateIR.ps1 live here) ───
       - name: Checkout template repository
         uses: actions/checkout@v3
         with:
-          repository: ATCO-Data-Analytics/ATCO-Data-Analytics-EnterpriseLakehouse-ADF-ReleaseManagementTemplates
+          repository: <YOUR_ORG>/adf-release-mgmt-template
           ref: main
           path: template-repo
           token: ${{ steps.app-token.outputs.token }}
 
+      # ── 4. Azure Login via Managed Identity (OIDC) ───────────────────────
       - name: Azure Login
         uses: azure/login@v2
         with:
@@ -80,87 +127,98 @@ jobs:
           subscription-id: ${{ inputs.TRG_SUBS_ID }}
           enable-AzPSSession: true
 
+      # ── 5. Install ADF build utilities ───────────────────────────────────
       - name: Install NPM
         run: npm install
 
-      - name: Validte ADF
-        run: npm run build validate $(pwd) /subscriptions/${{ inputs.SRC_SUBS_ID }}/resourceGroups/${{ inputs.SRC_RG }}/providers/Microsoft.DataFactory/factories/${{ inputs.SRC_ADF_NAME }}
+      # ── 6. Validate ADF JSON against DEV factory ─────────────────────────
+      - name: Validate ADF
+        run: |
+          npm run build validate $(pwd) \
+            /subscriptions/${{ inputs.SRC_SUBS_ID }}/resourceGroups/${{ inputs.SRC_RG }}/providers/Microsoft.DataFactory/factories/${{ inputs.SRC_ADF_NAME }}
 
+      # ── 7. Export ARM Templates from DEV ADF ─────────────────────────────
       - name: Generate ARM Template
-        run: npm run build export $(pwd) /subscriptions/${{ inputs.SRC_SUBS_ID }}/resourceGroups/${{ inputs.SRC_RG }}/providers/Microsoft.DataFactory/factories/${{ inputs.SRC_ADF_NAME }} "ArmTemplate"
-    
-      - name: List content of current directory
+        run: |
+          npm run build export $(pwd) \
+            /subscriptions/${{ inputs.SRC_SUBS_ID }}/resourceGroups/${{ inputs.SRC_RG }}/providers/Microsoft.DataFactory/factories/${{ inputs.SRC_ADF_NAME }} \
+            "ArmTemplate"
+
+      - name: List ArmTemplate directory (post-export)
         run: ls -R ArmTemplate/
 
-      - name: List content of current directory
+      - name: List template-repo directory
         run: ls -R template-repo
-        
-      - name: Update IR
+
+      # ── 8. Replace Source IR → Target IR in all ARM JSON files ───────────
+      - name: Update Integration Runtime Names
         shell: pwsh
         run: |
-            Write-Host "Script started.."
+          Write-Host "Script started.."
+          $sourceDir = $env:SOURCE_DIR
+          $filePattern = $env:FILE_PATTERN
+          $replacements = @{}
 
-            $sourceDir = $env:SOURCE_DIR
-            $filePattern = $env:FILE_PATTERN
-            $replacements = @{}
-  
-            # Add replacements from env variables
-            if ($env:REPLACE_KEY1 -and $env:REPLACE_VALUE1) {
-                $replacements[$env:REPLACE_KEY1] = $env:REPLACE_VALUE1
-                Write-Host "Replacement loaded: $($env:REPLACE_KEY1) -> $($env:REPLACE_VALUE1)"
-            } else {
-                Write-Host "No replacements defined. Exiting."
-                exit 0
-            }
-  
-            # Function to replace keys in ARM template files
-            function Replace-LinkedServiceNames {
-                param (
-                    [string]$Directory,
-                    [string]$FilePattern,
-                    [hashtable]$Replacements
-                )
-  
-                Get-ChildItem -Path $Directory -Recurse -File |
-                Where-Object { $_.Name.ToLower().StartsWith('armtemplate') -and $_.Name.EndsWith($FilePattern) } |
-                ForEach-Object {
-                    $filePath = $_.FullName
-                    $content = Get-Content -Path $filePath -Raw
-  
-                    foreach ($key in $Replacements.Keys) {
-                        $value = $Replacements[$key]
-                        $content = $content -replace [Regex]::Escape($key), $value
-                        Write-Host "Replaced '$key' with '$value' in $filePath"
-                    }
-  
-                    Set-Content -Path $filePath -Value $content -Encoding UTF8
-                }
-            }
+          if ($env:REPLACE_KEY1 -and $env:REPLACE_VALUE1) {
+              $replacements[$env:REPLACE_KEY1] = $env:REPLACE_VALUE1
+              Write-Host "Replacement loaded: $($env:REPLACE_KEY1) -> $($env:REPLACE_VALUE1)"
+          } else {
+              Write-Host "No IR replacements defined. Skipping."
+              exit 0
+          }
 
-            Replace-LinkedServiceNames -Directory $sourceDir -FilePattern $filePattern -Replacements $replacements
-  
-            Write-Host "Script completed successfully!"
+          function Replace-LinkedServiceNames {
+              param (
+                  [string]$Directory,
+                  [string]$FilePattern,
+                  [hashtable]$Replacements
+              )
+              Get-ChildItem -Path $Directory -Recurse -File |
+              Where-Object { $_.Name.ToLower().StartsWith('armtemplate') -and $_.Name.EndsWith($FilePattern) } |
+              ForEach-Object {
+                  $filePath = $_.FullName
+                  $content = Get-Content -Path $filePath -Raw
+                  foreach ($key in $Replacements.Keys) {
+                      $value = $Replacements[$key]
+                      $content = $content -replace [Regex]::Escape($key), $value
+                      Write-Host "Replaced '$key' with '$value' in $filePath"
+                  }
+                  Set-Content -Path $filePath -Value $content -Encoding UTF8
+              }
+          }
 
+          Replace-LinkedServiceNames -Directory $sourceDir -FilePattern $filePattern -Replacements $replacements
+          Write-Host "Script completed successfully!"
 
-          
-      - name: List content of current directory
+      - name: List ArmTemplate directory (post IR update)
         run: ls -R ArmTemplate/
 
-      - name: Run PowerShell Script to Update parameters
+      # ── 9. Merge .env/<ENV>.txt overrides → parameters.updated.json ──────
+      - name: Update ARM Parameters for Environment
         shell: pwsh
         run: |
-          ./template-repo/update.ps1 -parameterFile ${{ inputs.ParameterFileName }} -variablesFile .env/${{ inputs.environment }}.txt
+          ./template-repo/update.ps1 `
+            -parameterFile ${{ inputs.ParameterFileName }} `
+            -variablesFile .env/${{ inputs.environment }}.txt
 
-      - name: List existing master template
+      - name: List master ARM template (pre-deploy)
         run: cat ./ArmTemplate/ARMTemplateForFactory.json
 
-      - name: List updated parameters
+      - name: List updated parameters (pre-deploy)
         run: cat ./parameters.updated.json
 
-      - name: Run Pre-Deployment
+      # ── 10. Pre-Deployment: stop all ADF triggers ─────────────────────────
+      - name: Run Pre-Deployment (Stop Triggers)
         shell: pwsh
-        run: pwsh -File ./ArmTemplate/PrePostDeploymentScript.ps1 -armTemplate "./ArmTemplate/ARMTemplateForFactory.json" -ResourceGroupName ${{ inputs.TRG_RG }} -DataFactoryName ${{ inputs.TRG_ADF_NAME }} -predeployment:$true -deleteDeployment:$false
+        run: |
+          pwsh -File ./ArmTemplate/PrePostDeploymentScript.ps1 `
+            -armTemplate "./ArmTemplate/ARMTemplateForFactory.json" `
+            -ResourceGroupName ${{ inputs.TRG_RG }} `
+            -DataFactoryName ${{ inputs.TRG_ADF_NAME }} `
+            -predeployment:$true `
+            -deleteDeployment:$false
 
+      # ── 11. Deploy ARM Template (Incremental) ────────────────────────────
       - name: Deploy ARM Template
         uses: azure/arm-deploy@v1
         with:
@@ -171,6 +229,13 @@ jobs:
           parameters: ./parameters.updated.json
           deploymentMode: Incremental
 
-      - name: Run Post-Deployment
+      # ── 12. Post-Deployment: restart triggers + remove deleted resources ──
+      - name: Run Post-Deployment (Restart Triggers & Cleanup)
         shell: pwsh
-        run: pwsh -File ./ArmTemplate/PrePostDeploymentScript.ps1 -armTemplate "./ArmTemplate/ARMTemplateForFactory.json" -ResourceGroupName ${{ inputs.TRG_RG }} -DataFactoryName ${{ inputs.TRG_ADF_NAME }} -predeployment:$false -deleteDeployment:$true
+        run: |
+          pwsh -File ./ArmTemplate/PrePostDeploymentScript.ps1 `
+            -armTemplate "./ArmTemplate/ARMTemplateForFactory.json" `
+            -ResourceGroupName ${{ inputs.TRG_RG }} `
+            -DataFactoryName ${{ inputs.TRG_ADF_NAME }} `
+            -predeployment:$false `
+            -deleteDeployment:$true
