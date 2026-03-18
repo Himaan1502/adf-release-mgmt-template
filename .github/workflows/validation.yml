@@ -1,0 +1,57 @@
+name: ADF CI/CD Validation Pipeline
+
+on:
+  workflow_call:
+    inputs:
+          ADF_NAME:
+            required: true
+            type: string
+          RG:
+            required: true
+            type: string
+          SUBS_ID:
+            required: true
+            type: string
+          TENANT_ID:
+            required: true
+            type: string
+
+jobs:
+  build:
+    name: Validate ADF Artifacts
+    #environment: ${{ inputs.environment }}
+    runs-on:
+      group: Non-Prod
+      labels: [self-hosted]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          auth-type: IDENTITY
+          tenant-id: ${{ inputs.TENANT_ID }}
+          subscription-id: ${{ inputs.SUBS_ID }}
+          enable-AzPSSession: true
+
+      - name: Install NPM
+        run: npm install
+
+      - name: Validte ADF
+        run: npm run build validate ${{ GITHUB.WORKSPACE }} /subscriptions/${{ inputs.SUBS_ID }}/resourceGroups/${{ inputs.RG }}/providers/Microsoft.DataFactory/factories/${{ inputs.ADF_NAME }}
+
+      - name: Generate ARM Template
+        run: npm run build export ${{ GITHUB.WORKSPACE }} /subscriptions/${{ inputs.SUBS_ID }}/resourceGroups/${{ inputs.RG }}/providers/Microsoft.DataFactory/factories/${{ inputs.ADF_NAME }} "ArmTemplate"
+
+      - name: List content of current directory
+        run: ls -R ArmTemplate/
+
+      - name: List existing parameters
+        run: cat ./ArmTemplate/ARMTemplateParametersForFactory.json
+
+      - name: List existing master template file
+        run: cat ./ArmTemplate/ARMTemplateForFactory.json
+
+      - name: Cleanup
+        run: rm -rf ./ArmTemplate/
